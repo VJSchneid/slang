@@ -10,6 +10,37 @@ using namespace slang;
 using namespace slang::ast;
 
 namespace no_old_always_syntax {
+
+/// Looks for Assignment and Variable Declarations to determine whether non local assignments are
+/// made
+struct AssignmentLookup : public ASTVisitor<AssignmentLookup, true, true> {
+    void handle(ast::AssignmentExpression const& expr) {
+        auto left_symbol = expr.left().getSymbolReference();
+        assignments.emplace_back(&expr);
+    }
+
+    void handle(ast::VariableDeclStatement const& stmt) {
+        localVariables.emplace_back(&stmt.symbol);
+    }
+
+    std::vector<AssignmentExpression const*> nonLocalAssignments() {
+        auto is_not_local = [&](AssignmentExpression const* expr) {
+            auto symbol = expr->left().getSymbolReference();
+            return std::find(localVariables.begin(), localVariables.end(), symbol) ==
+                   localVariables.end();
+        };
+
+        std::vector<AssignmentExpression const*> result;
+        std::copy_if(assignments.begin(), assignments.end(), std::back_inserter(result),
+                     is_not_local);
+
+        return result;
+    }
+
+    std::vector<VariableSymbol const*> localVariables;
+    std::vector<AssignmentExpression const*> assignments;
+};
+
 struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, true> {
     explicit MainVisitor(Diagnostics& diagnostics) : TidyVisitor(diagnostics) {}
 
@@ -20,7 +51,16 @@ struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, true> {
             return;
 
         if (symbol.procedureKind == ProceduralBlockKind::Always) {
-            diags.add(diag::NoOldAlwaysSyntax, symbol.location);
+            // There are still legit uses of always_comb (e.g. for formal verification). To prevent
+            // warnings with such always blocks, it is checked whether the block contains
+            // assignments to variables of an upper scope. Such assignments suggest that
+            // always_{comb,latch,ff} blocks are better suited here.
+            AssignmentLookup lookup;
+            symbol.getBody().visit(lookup);
+
+            if (!lookup.nonLocalAssignments().empty()) {
+                diags.add(diag::NoOldAlwaysSyntax, symbol.location);
+            }
         }
     }
 };
